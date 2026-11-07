@@ -1,0 +1,144 @@
+name: Release Yoyo
+run-name: Release Yoyo ${{ github.event_name == 'push' && github.ref_name || (startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version)) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本号（X.Y.Z）
+        type: string
+        required: true
+      ref:
+        description: 留空使用当前选择的版本；签名构建要求与所选工作流版本为同一提交
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yoyo-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建所有平台版本
+    uses: ./.github/workflows/debug.yml
+    with:
+      target: all
+      ref: ${{ inputs.ref || github.sha }}
+      version: ${{ inputs.version || github.ref_name }}
+      generatePatch: true
+      androidRelease: true
+    secrets:
+      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_NOTARIZATION_KEY_ID: ${{ secrets.MACOS_NOTARIZATION_KEY_ID }}
+      MACOS_NOTARIZATION_ISSUER_ID: ${{ secrets.MACOS_NOTARIZATION_ISSUER_ID }}
+      MACOS_NOTARIZATION_KEY_BASE64: ${{ secrets.MACOS_NOTARIZATION_KEY_BASE64 }}
+
+  release:
+    name: 发布 GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 校验已有版本标签
+        env:
+          GH_TOKEN: ${{ github.token }}
+          releaseVersion: ${{ needs.build.outputs.version }}
+          buildCommit: ${{ needs.build.outputs.commit }}
+        run: |
+          node --input-type=module <<'JS'
+          const tag = `refs/tags/v${process.env.releaseVersion}`;
+          const api = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}`;
+          const headers = { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: "application/vnd.github+json" };
+          let response = await fetch(`${api}/git/ref/tags/v${process.env.releaseVersion}`, {
+            headers,
+            signal: AbortSignal.timeout(30000),
+          });
+          if (response.status !== 404) {
+            if (!response.ok) throw new Error(`读取版本标签失败（HTTP ${response.status}）`);
+            let { object } = await response.json();
+            while (object.type === "tag") {
+              response = await fetch(`${api}/git/tags/${object.sha}`, { headers, signal: AbortSignal.timeout(30000) });
+              if (!response.ok) throw new Error(`解析版本标签失败（HTTP ${response.status}）`);
+              ({ object } = await response.json());
+            }
+            if (object.type !== "commit" || object.sha !== process.env.buildCommit) throw new Error(`${tag} 与构建提交不一致，请使用新版本号或选择该标签对应的代码。`);
+          }
+          JS
+      - name: 下载各平台产物
+        uses: actions/download-artifact@v8
+        with:
+          pattern: yoyo-${{ needs.build.outputs.version }}-*
+          path: artifacts
+          merge-multiple: true
+      - name: 生成下载说明
+        env:
+          releaseVersion: ${{ needs.build.outputs.version }}
+        run: |
+          node --input-type=module <<'JS'
+          import { readdirSync, writeFileSync } from "node:fs";
+
+          const files = readdirSync("artifacts");
+          const version = process.env.releaseVersion;
+          const findInstaller = (label, matches) => {
+            const names = files.filter(matches);
+            if (names.length !== 1) throw new Error(`${label} 安装包数量应为 1，实际为 ${names.length}`);
+            return names[0];
+          };
+          const windows = findInstaller("Windows x64", name => name === `yoyo-${version}-Setup.exe`);
+          const windowsArm = findInstaller("Windows ARM64", name => name === `yoyo-${version}-win-arm64-Setup.exe`);
+          const macArm = findInstaller("macOS ARM64", name => name === `yoyo-${version}-macos-arm64.dmg`);
+          const macIntel = findInstaller("macOS x64", name => name === `yoyo-${version}-macos-x64.dmg`);
+          const linux = findInstaller("Linux x64", name => name === `yoyo-${version}-linux-x64.deb`);
+          const linuxArm = findInstaller("Linux ARM64", name => name === `yoyo-${version}-linux-arm64.deb`);
+          const android = findInstaller("Android ARM64", name => name === `yoyo-${version}-android-arm64.apk`);
+          const baseUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/releases/download/v${version}`;
+          const download = name => `${baseUrl}/${encodeURIComponent(name)}`;
+          writeFileSync("releaseBody.md", [
+            "## 📦 下载指南",
+            "",
+            "选择你的设备对应的安装包，点击即可下载：",
+            "",
+            "| 你的设备 | 下载 |",
+            "| --- | --- |",
+            `| 💻 Windows（Intel / AMD，x64） | [⬇️ 下载 Windows x64 安装包](${download(windows)}) |`,
+            `| 💻 Windows（ARM64） | [⬇️ 下载 Windows ARM64 安装包](${download(windowsArm)}) |`,
+            `| 🍎 Mac（M 系列芯片） | [⬇️ 下载 M 系列 Mac 安装包](${download(macArm)}) |`,
+            `| 🍎 Mac（Intel 芯片） | [⬇️ 下载 Intel Mac 安装包](${download(macIntel)}) |`,
+            `| 🐧 Linux（Intel / AMD，x64） | [⬇️ 下载 Linux x64 DEB](${download(linux)}) |`,
+            `| 🐧 Linux（ARM64） | [⬇️ 下载 Linux ARM64 DEB](${download(linuxArm)}) |`,
+            `| 📱 Android（ARM64，Android 8 及以上） | [⬇️ 下载 Android APK](${download(android)}) |`,
+            "",
+            "> 💡 手动安装请选择上表中的链接。下方其他文件供软件自动更新使用。",
+            "",
+            "## 🚀 安装说明",
+            "",
+            "- 💻 **Windows**：双击下载的安装包，按提示完成安装。ARM64 需要 .NET Framework 4.8.1，较新的 Windows 11 已内置。",
+            "- 🍎 **Mac（macOS 14 及以上）**：打开下载的 `.dmg` 镜像，将 `yoyo.app` 拖入“应用程序”，复制完成后再从“应用程序”打开。",
+            "- 🐧 **Linux（Debian / Ubuntu）**：选择对应架构的 DEB，在下载目录执行 `sudo apt install ./yoyo-版本号-linux-架构.deb`，安装后从应用菜单打开。",
+            "- 📱 **Android**：在手机上打开 APK，按系统提示允许此来源安装应用。后续版本可直接覆盖安装。",
+            "",
+            "Mac 应用与 DMG 镜像在配置了 Apple 签名凭据时使用 Developer ID Application 签名并完成公证；未配置时产物未签名，首次打开需在系统设置的“隐私与安全性”中允许，或用右键菜单选择“打开”。",
+            "旧版 Intel Mac 客户端首次迁移到统一 SDK 版本时，请下载完整 DMG 覆盖安装；旧版增量更新不能直接迁移。安装前请退出应用并备份原数据目录。",
+            "",
+            "---",
+            "",
+          ].join("\n"));
+          JS
+      - name: 发布安装包及更新文件
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          target_commitish: ${{ needs.build.outputs.commit }}
+          name: Yoyo短剧平台 ${{ needs.build.outputs.version }}
+          make_latest: true
+          body_path: releaseBody.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*
